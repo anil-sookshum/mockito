@@ -20,6 +20,10 @@ import 'package:analyzer/dart/element/type.dart' as analyzer;
 import 'package:analyzer/dart/element/type_provider.dart';
 import 'package:analyzer/dart/element/type_system.dart';
 import 'package:analyzer/dart/element/visitor.dart';
+import 'package:analyzer/src/dart/element/inheritance_manager3.dart'
+    show InheritanceManager3;
+import 'package:analyzer/src/dart/element/member.dart' show ExecutableMember;
+import 'package:analyzer/src/dart/element/type_algebra.dart' show Substitution;
 import 'package:build/build.dart';
 // Do not expose [refer] in the default namespace.
 //
@@ -89,7 +93,9 @@ class MockBuilder implements Builder {
           '// ignore_for_file: invalid_use_of_visible_for_testing_member\n'));
       b.body.add(Code('// ignore_for_file: prefer_const_constructors\n'));
       // The code_builder `asA` API unconditionally adds defensive parentheses.
-      b.body.add(Code('// ignore_for_file: unnecessary_parenthesis\n\n'));
+      b.body.add(Code('// ignore_for_file: unnecessary_parenthesis\n'));
+      // The generator appends a suffix to fake classes
+      b.body.add(Code('// ignore_for_file: camel_case_types\n\n'));
       b.body.addAll(mockLibraryInfo.fakeClasses);
       b.body.addAll(mockLibraryInfo.mockClasses);
     });
@@ -151,10 +157,7 @@ $rawOutput
 
     for (final element in elements) {
       final elementLibrary = element.library!;
-      if (elementLibrary.isInSdk &&
-          // TODO(srawlins): Remove this when analyzer dep is >=2.0.0.
-          // ignore: unnecessary_non_null_assertion
-          !elementLibrary.name!.startsWith('dart._')) {
+      if (elementLibrary.isInSdk && !elementLibrary.name.startsWith('dart._')) {
         // For public SDK libraries, just use the source URI.
         typeUris[element] = elementLibrary.source.uri.toString();
         continue;
@@ -287,7 +290,7 @@ class _TypeVisitor extends RecursiveElementVisitor<void> {
       for (var parameter in type.parameters) {
         parameter.accept(this);
       }
-      var aliasElement = type.aliasElement;
+      var aliasElement = type.alias?.element;
       if (aliasElement != null) {
         _elements.add(aliasElement);
       }
@@ -513,7 +516,7 @@ class _MockTargetGatherer {
       return typeToMock;
     }
 
-    var aliasElement = typeToMock.aliasElement;
+    var aliasElement = typeToMock.alias?.element;
     if (aliasElement != null) {
       throw InvalidMockitoAnnotationException('Mockito cannot mock a typedef: '
           '${aliasElement.displayName}');
@@ -658,7 +661,7 @@ class _MockTargetGatherer {
     errorMessages
         .addAll(_checkTypeParameters(function.typeFormals, enclosingElement));
 
-    var aliasArguments = function.aliasArguments;
+    var aliasArguments = function.alias?.typeArguments;
     if (aliasArguments != null) {
       errorMessages
           .addAll(_checkTypeArguments(aliasArguments, enclosingElement));
@@ -753,6 +756,14 @@ class _MockLibraryInfo {
       )._buildMockClass());
     }
   }
+
+  var _fakeNameCounter = 0;
+
+  final _fakeNames = <Element, String>{};
+
+  /// Generates a unique name for a fake class representing [element].
+  String _fakeNameFor(Element element) => _fakeNames.putIfAbsent(
+      element, () => '_Fake${element.name}_${_fakeNameCounter++}');
 }
 
 class _MockClassInfo {
@@ -812,10 +823,7 @@ class _MockClassInfo {
         // implements the mock target with said type arguments. For example:
         // `class MockFoo extends Mock implements Foo<int> {}`
         for (var typeArgument in typeToMock.typeArguments) {
-          typeArguments.add(referImported(
-              typeArgument.getDisplayString(
-                  withNullability: sourceLibIsNonNullable),
-              _typeImport(typeArgument.element)));
+          typeArguments.add(_typeReference(typeArgument));
         }
       } else if (classToMock.typeParameters != null) {
         // [typeToMock] is a simple reference to a generic type (for example:
@@ -842,33 +850,40 @@ class _MockClassInfo {
       if (!sourceLibIsNonNullable) {
         return;
       }
-      cBuilder.methods.addAll(fieldOverrides(typeToMock, {}));
-      cBuilder.methods.addAll(methodOverrides(typeToMock, {}));
+      final inheritanceManager = InheritanceManager3();
+      final substitution = Substitution.fromInterfaceType(typeToMock);
+      final members =
+          inheritanceManager.getInterface(classToMock).map.values.map((member) {
+        return ExecutableMember.from2(member, substitution);
+      });
+      cBuilder.methods
+          .addAll(fieldOverrides(members.whereType<PropertyAccessorElement>()));
+      cBuilder.methods
+          .addAll(methodOverrides(members.whereType<MethodElement>()));
     });
   }
 
   /// Yields all of the field overrides required for [type].
   ///
-  /// This includes fields of supertypes and mixed in types. [overriddenFields]
-  /// is used to track which fields have already been yielded.
+  /// This includes fields of supertypes and mixed in types.
   ///
   /// Only public instance fields which have either a potentially non-nullable
   /// return type (for getters) or a parameter with a potentially non-nullable
   /// type (for setters) are yielded.
   Iterable<Method> fieldOverrides(
-      analyzer.InterfaceType type, Set<String> overriddenFields) sync* {
-    for (final accessor in type.accessors) {
-      if (accessor.isPrivate || accessor.isStatic) {
-        continue;
-      }
-      if (overriddenFields.contains(accessor.name)) {
+      Iterable<PropertyAccessorElement> accessors) sync* {
+    for (final accessor in accessors) {
+      if (accessor.isPrivate) {
         continue;
       }
       if (accessor.name == 'hashCode') {
         // Never override this getter; user code cannot narrow the return type.
         continue;
       }
-      overriddenFields.add(accessor.name);
+      if (accessor.name == 'runtimeType') {
+        // Never override this getter; user code cannot narrow the return type.
+        continue;
+      }
       if (accessor.isGetter && _returnTypeIsNonNullable(accessor)) {
         yield Method((mBuilder) => _buildOverridingGetter(mBuilder, accessor));
       }
@@ -876,42 +891,21 @@ class _MockClassInfo {
         yield Method((mBuilder) => _buildOverridingSetter(mBuilder, accessor));
       }
     }
-    if (type.mixins != null) {
-      for (var mixin in type.mixins) {
-        yield* fieldOverrides(mixin, overriddenFields);
-      }
-    }
-    if (type.interfaces != null) {
-      for (var interface in type.interfaces) {
-        yield* fieldOverrides(interface, overriddenFields);
-      }
-    }
-    var superclass = type.superclass;
-    if (superclass != null && !superclass.isDartCoreObject) {
-      yield* fieldOverrides(superclass, overriddenFields);
-    }
   }
 
   /// Yields all of the method overrides required for [type].
   ///
   /// This includes methods of supertypes and mixed in types.
-  /// [overriddenMethods] is used to track which methods have already been
-  /// yielded.
   ///
   /// Only public instance methods which have either a potentially non-nullable
   /// return type or a parameter with a potentially non-nullable type are
   /// yielded.
-  Iterable<Method> methodOverrides(
-      analyzer.InterfaceType type, Set<String> overriddenMethods) sync* {
-    for (final method in type.methods) {
-      if (method.isPrivate || method.isStatic) {
+  Iterable<Method> methodOverrides(Iterable<MethodElement> methods) sync* {
+    for (final method in methods) {
+      if (method.isPrivate) {
         continue;
       }
-      var methodName = method.name;
-      if (overriddenMethods.contains(methodName)) {
-        continue;
-      }
-      overriddenMethods.add(methodName);
+      final methodName = method.name;
       if (methodName == 'noSuchMethod') {
         continue;
       }
@@ -925,20 +919,6 @@ class _MockClassInfo {
           _needsOverrideForVoidStub(method)) {
         yield Method((mBuilder) => _buildOverridingMethod(mBuilder, method));
       }
-    }
-    if (type.mixins != null) {
-      for (var mixin in type.mixins) {
-        yield* methodOverrides(mixin, overriddenMethods);
-      }
-    }
-    if (type.interfaces != null) {
-      for (var interface in type.interfaces) {
-        yield* methodOverrides(interface, overriddenMethods);
-      }
-    }
-    var superclass = type.superclass;
-    if (superclass != null && !superclass.isDartCoreObject) {
-      yield* methodOverrides(superclass, overriddenMethods);
     }
   }
 
@@ -1178,10 +1158,7 @@ class _MockClassInfo {
       return _typeReference(dartType).property(
           elementToFake.fields.firstWhere((f) => f.isEnumConstant).name);
     } else {
-      // There is a potential for these names to collide. If one mock class
-      // requires a fake for a certain Foo, and another mock class requires a
-      // fake for a different Foo, they will collide.
-      final fakeName = '_Fake${elementToFake.name}';
+      final fakeName = mockLibraryInfo._fakeNameFor(elementToFake);
       // Only make one fake class for each class that needs to be faked.
       if (!mockLibraryInfo.fakedClassElements.contains(elementToFake)) {
         _addFakeClass(fakeName, elementToFake);
@@ -1252,8 +1229,9 @@ class _MockClassInfo {
       if (parameter.isNamed) pBuilder.named = true;
       if (parameter.defaultValueCode != null) {
         try {
-          pBuilder.defaultTo =
-              _expressionFromDartObject(parameter.computeConstantValue()!).code;
+          pBuilder.defaultTo = _expressionFromDartObject(
+                  parameter.computeConstantValue()!, parameter)
+              .code;
         } on _ReviveException catch (e) {
           final method = parameter.enclosingElement!;
           final clazz = method.enclosingElement!;
@@ -1267,11 +1245,13 @@ class _MockClassInfo {
   }
 
   /// Creates a code_builder [Expression] from [object], a constant object from
-  /// analyzer.
+  /// analyzer and [parameter], an optional [ParameterElement], when the
+  /// expression is created for a method parameter default value.
   ///
   /// This is very similar to Angular's revive code, in
   /// angular_compiler/analyzer/di/injector.dart.
-  Expression _expressionFromDartObject(DartObject object) {
+  Expression _expressionFromDartObject(DartObject object,
+      [ParameterElement? parameter]) {
     final constant = ConstantReader(object);
     if (constant.isNull) {
       return literalNull;
@@ -1337,7 +1317,10 @@ class _MockClassInfo {
         for (var pair in revivable.namedArguments.entries)
           pair.key: _expressionFromDartObject(pair.value)
       };
-      final type = referImported(name, _typeImport(object.type!.element));
+      final element = parameter != null && name != object.type!.element!.name
+          ? parameter.type.element
+          : object.type!.element;
+      final type = referImported(name, _typeImport(element));
       if (revivable.accessor.isNotEmpty) {
         return type.constInstanceNamed(
           revivable.accessor,
@@ -1441,8 +1424,8 @@ class _MockClassInfo {
           ..types.addAll(type.typeArguments.map(_typeReference));
       });
     } else if (type is analyzer.FunctionType) {
-      final element = type.aliasElement;
-      if (element == null || element.isPrivate) {
+      final alias = type.alias;
+      if (alias == null || alias.element.isPrivate) {
         // [type] does not refer to a type alias, or it refers to a private type
         // alias; we must instead write out its signature.
         return FunctionType((b) {
@@ -1464,10 +1447,10 @@ class _MockClassInfo {
       }
       return TypeReference((b) {
         b
-          ..symbol = element.name
-          ..url = _typeImport(element)
+          ..symbol = alias.element.name
+          ..url = _typeImport(alias.element)
           ..isNullable = forceNullable || typeSystem.isNullable(type);
-        for (var typeArgument in type.aliasArguments!) {
+        for (var typeArgument in alias.typeArguments) {
           b.types.add(_typeReference(typeArgument));
         }
       });

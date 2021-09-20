@@ -1,3 +1,29 @@
+## 5.0.16
+
+* Fix type reference for nested, imported types found in type arguments on a
+  custom class-to-mock.
+  [#469](https://github.com/dart-lang/mockito/issues/469)
+* Bump minimum analyzer dependency to version 2.1.0.
+* Ignore `camel_case_types` lint in generated code.
+
+## 5.0.15
+
+* Fix an issue generating the correct parameter default value given a
+  constructor which redirects to a constructor declared in a separate library.
+  [#459](https://github.com/dart-lang/mockito/issues/459)
+
+## 5.0.14
+
+* Generate Fake classes with unique names.
+  [#441](https://github.com/dart-lang/mockito/issues/441)
+
+## 5.0.13
+
+* Implement methods which have been overridden in the mixin hierarchy properly.
+  Previously, mixins were being applied in the wrong order, which could skip
+  over one method that overrides another with a different signature.
+  [#456](https://github.com/dart-lang/mockito/issues/456)
+
 ## 5.0.12
 
 * Use an empty list with a correct type argument for a fallback value for a
